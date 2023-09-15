@@ -8,7 +8,7 @@ use indicatif::{MultiProgress, ProgressBar};
 use mn2::count::count_file_configs_into_map_par;
 use mn2::discovery::k_neighbours::{logscores_from_map, ranking_from_logscore_matrix};
 
-/// Use command: (can replace parameters 3 and sample.100.mn2)
+/// Use command: (can replace parameters 2 and sample.100.mn2)
 /// cargo run --release -- 2 sample.100.mn2
 fn main() {
     let mut args = std::env::args();
