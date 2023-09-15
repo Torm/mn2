@@ -1,0 +1,25 @@
+[package]
+name = "mn2"
+version = "0.1.0"
+authors = ["Torm"]
+edition = "2021"
+
+[dependencies]
+ndarray = "0.15.6"
+statrs = "0.16.0"
+nalgebra = "0.32.2"
+special = "0.10.2"
+dashmap = { version = "5.5.3", features = ["rayon", "inline"] }
+fxhash = { version = "0.2.1", features = [] }
+byteorder = "1.4.3"
+rayon = "1.7.0"
+parking_lot = { version = "0.12.1", features = [] }
+console = { version = "0.15.7", features = [] }
+indicatif = { version = "0.17.6", features = ["rayon", "improved_unicode"] }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports"] }
+
+[[bench]]
+name = "main"
+harness = false
