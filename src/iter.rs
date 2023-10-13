@@ -185,8 +185,12 @@ impl <'a> ChildConfigIter<'a> {
         &self.buffer
     }
 
-    fn index(&self) -> usize {
+    pub fn index(&self) -> usize {
         self.index
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 
 }

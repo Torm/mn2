@@ -6,7 +6,7 @@ use std::time::{Instant};
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar};
 use mn2::count::count_file_configs_into_map_par;
-use mn2::discovery::k_neighbours::{logscores_from_map, ranking_from_logscore_matrix};
+use mn2::discovery::k_neighbours::{familyscores_from_counts, process_family_scores, process_logscore_matrix};
 
 /// Use command: (can replace parameters 2 and sample.100.mn2)
 /// cargo run --release -- 2 sample.100.mn2
@@ -29,9 +29,9 @@ fn main() {
     };
     let file = File::open(&path).unwrap();
     let terminal = Term::stdout();
-    terminal.write_line("#########################").unwrap();
+    terminal.write_line("#####################################################################").unwrap();
     terminal.write_line(&format!("Discovery method=kn k={} file={}", k, &path)).unwrap();
-    terminal.write_line("#########################").unwrap();
+    terminal.write_line("#####################################################################").unwrap();
     terminal.write_line("[ ] Count...").unwrap();
     let bars = MultiProgress::new();
     let row_bar = bars.add(ProgressBar::new(1000));
@@ -44,26 +44,34 @@ fn main() {
     terminal.move_cursor_up(1).unwrap();
     terminal.write_line("[X] Count").unwrap();
     terminal.write_line(&format!("        [time={}ms] [unique-configs={}]", (t1 - t0).as_millis(), counts.len())).unwrap();
-    terminal.write_line("[ ] Accumulate logscores...").unwrap();
+    terminal.write_line("[ ] Accumulate family scores...").unwrap();
     let t0 = Instant::now();
-    let (logscores, max, min, accumulated, discarded) = logscores_from_map(k, &variables, counts, Some(10000.0)).unwrap();
+    let (logscores, terms) = familyscores_from_counts(k, &variables, counts, Some(30.0)).unwrap();
     let t1 = Instant::now();
     terminal.move_cursor_left(10000).unwrap();
     terminal.move_cursor_up(1).unwrap();
-    terminal.write_line("[X] Accumulate logscores").unwrap();
-    terminal.write_line(&format!("        [time={}ms] [accumulated={}] [discarded={}] [total={}] [max={}] [min={}]", (t1 - t0).as_millis(), accumulated, discarded, accumulated + discarded, max, min)).unwrap();
-    terminal.write_line("[ ] Compute scores, merge scores, rank arcs...").unwrap();
+    terminal.write_line("[X] Accumulate family scores").unwrap();
+    terminal.write_line(&format!("        [time={}ms] [terms={}]", (t1 - t0).as_millis(), terms)).unwrap();
+    terminal.write_line("[ ] Process family scores...").unwrap();
     let t0 = Instant::now();
-    let ranking = ranking_from_logscore_matrix(logscores).unwrap();
+    let (matrix, accumulated, discarded) = process_family_scores(n as u32, logscores, Some(30.0)).unwrap();
     let t1 = Instant::now();
     terminal.move_cursor_left(10000).unwrap();
     terminal.move_cursor_up(1).unwrap();
-    terminal.write_line("[X] Compute scores, merge scores, rank arcs").unwrap();
+    terminal.write_line("[X] Process family scores").unwrap();
+    terminal.write_line(&format!("        [time={}ms] [accumulated={}] [discarded={}] [total={}]", (t1 - t0).as_millis(), accumulated, discarded, accumulated + discarded)).unwrap();
+    terminal.write_line("[ ] Calculate probabilities & model average...").unwrap();
+    let t0 = Instant::now();
+    let ranking = process_logscore_matrix(n as u32, matrix).unwrap();
+    let t1 = Instant::now();
+    terminal.move_cursor_left(10000).unwrap();
+    terminal.move_cursor_up(1).unwrap();
+    terminal.write_line("[X] Calculate probabilities & model average").unwrap();
     terminal.write_line(&format!("        [time={}ms]", (t1 - t0).as_millis())).unwrap();
     terminal.write_line(&format!("Top 100 rankings:")).unwrap();
     let mut c = 0;
     for r in ranking.iter() {
-        terminal.write_line(&format!("{} [{} -> {}] [{}]", c, r.0, r.1, r.2)).unwrap();
+        terminal.write_line(&format!("{} [{}—{}] [{}]", c, r.0, r.1, r.2)).unwrap();
         c += 1;
         if c == 100 {
             break;

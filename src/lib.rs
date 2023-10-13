@@ -109,6 +109,30 @@ pub fn logscore_prior(parent_count: u32, variable_alpha: f64) -> f64 {
     ln_gamma(variable_alpha) - ln_gamma(variable_alpha + parent_count as f64)
 }
 
+pub fn logscore_config(variable_count: u32, config_alpha: f64) -> f64 {
+    ln_gamma(config_alpha + variable_count as f64) - ln_gamma(config_alpha)
+}
+
+#[test]
+fn ffff() {
+    let alpha_v = 1.0/64.0; let alpha_c = 1.0/128.0; let pc = 1.0;
+    let prior = ln_gamma(alpha_v) - ln_gamma(alpha_v + pc);
+    let c1 = ln_gamma(alpha_c) - ln_gamma(alpha_c);
+    println!("Prior[{}] c1[{}] av[{}] ac[{}] r={}", prior, c1, ln_gamma(alpha_v), ln_gamma(alpha_c), prior + c1);
+    println!("Loggamma {} = {}", 0.0, ln_gamma(0.0));
+    println!("Loggamma {} = {}", 0.1, ln_gamma(0.1));
+    println!("Loggamma {} = {}", 0.2, ln_gamma(0.2));
+    println!("Loggamma {} = {}", 0.3, ln_gamma(0.3));
+    println!("Loggamma {} = {}", 0.5, ln_gamma(0.5));
+    println!("Loggamma {} = {}", 0.8, ln_gamma(0.8));
+    println!("Loggamma {} = {}", 1.0, ln_gamma(1.0));
+    println!("Loggamma {} = {}", 1.5, ln_gamma(1.5));
+    println!("Loggamma {} = {}", 2.0, ln_gamma(2.0));
+    println!("Loggamma {} = {}", 4.0, ln_gamma(4.0));
+
+
+}
+
 /// Compute the log-sum-exp of a set of logged values.
 ///
 /// https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/

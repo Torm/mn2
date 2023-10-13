@@ -2,6 +2,11 @@
 
 Discovery of Markov network structures.
 
+## Cargo usage
+
+Run with command: `cargo run -- <k> <mn2-file>`. Replace `<k>` with the number of neighbours
+and `<mn2-file>` with the path to the file containing the data.
+
 ## Binary format
 
 The input format describes tabular data with a header. The header contains information about
@@ -34,6 +39,7 @@ whitespace.
 - `sample.100.mn2`: 10*10 grid network, 100 binary variables, 1000 rows, 200 unique k1, 20000 unique
   k2, 1311247 unique k3
 - `sample.10.mn2`: 2*5 grid network, 10 binary variables, 1000 rows
+- `sample.4.mn2`: 2*2 grid network, 4 binary variables, 1000 rows
 
 ## Benchmarks
 

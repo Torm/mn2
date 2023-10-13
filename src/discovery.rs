@@ -101,12 +101,13 @@ pub enum LogScoreAccumulationMethod {
 ///
 /// These are the steps needed to compute a score for each arc:
 /// 1) Count the configurations in the input data.
-/// 2) Compute and accumulate logscores.
+/// 2) Compute and accumulate partial family scores.
+/// 3) Compute the family scores.
 /// 3) Compute asymmetric scores.
 /// 4) Merge asymmetric scores, using some merge method.
 /// 5) Create a ranking of arcs, sort by score.
 pub mod k_neighbours {
-
+    use std::cmp::max;
     use std::fs::File;
     use std::sync::Arc;
     use std::thread;
@@ -114,7 +115,8 @@ pub mod k_neighbours {
     use fxhash::FxBuildHasher;
     use parking_lot::{Mutex, RwLock};
     use rayon::slice::ParallelSliceMut;
-    use crate::{Array, Config, logscore, log_sum_exp, log_sum_exp_two, Variables, logscore_prior};
+    use log::log;
+    use crate::{Array, Config, logscore, log_sum_exp, log_sum_exp_two, Variables, logscore_prior, logscore_config};
     use crate::count;
     use crate::discovery::{Ranking};
     use crate::iter::{ChildConfigIter, VariableIter};
@@ -182,20 +184,22 @@ pub mod k_neighbours {
         count::count_file_configs_into_map_par(file, k as usize + 1, None)
     }
 
-    /// *Implements steps: 1*
-    pub fn score_arcs_by_k_neighbours_tree() -> Result<DashMap<Array<Config>, f64>, String> {
-        todo!();
-    }
-
-    /// A logscore matrix holds a [Vec] of logscore values for each of the `n * (n - 1)`
+    /// A logscore matrix holds a [Vec] of logscore values for each of the possible
     /// arcs `y -> x` between the nodes.
     pub struct LogscoreMatrix {
         n: usize,
         /// A logscore will be discarded, rather than appended, if it is lesser than
         /// `max - threshold`.
         threshold: f64,
+        arcs: Vec<LogscoreMatrixArc>,
+    }
+
+    #[derive(Clone)]
+    pub struct LogscoreMatrixArc {
+        /// The maximum found family score.
         max: f64,
-        arcs: Vec<Vec<f64>>,
+        /// A list of logscores. The flag is true if y is in the parent set of x, otherwise it is false.
+        logscores: Vec<(bool, f64)>,
     }
 
     impl LogscoreMatrix {
@@ -206,40 +210,50 @@ pub mod k_neighbours {
             Self {
                 n,
                 threshold: threshold.unwrap_or(f64::MAX),
-                max: f64::MIN,
-                arcs: vec![vec![]; n * n],
+                arcs: vec![LogscoreMatrixArc { max: f64::MIN, logscores: vec![] }; n * n],
             }
         }
 
-        fn append(&mut self, p: u32, x: u32, logscore: f64) -> bool {
-            if self.max - self.threshold > logscore {
-                return false;
+        ///
+        ///
+        /// If the flag is true, this logscore was computed where p was in the parent set of x. Otherwise,
+        /// p was not in the parent set.
+        fn append(&mut self, p: u32, x: u32, flag: bool, logscore: f64) -> bool {
+            let threshold = self.threshold;
+            let arc = self.get_mut(p, x);
+            if arc.max - threshold > logscore {
+                return false; // Do not append if it is too small compared to the largest found value.
             }
-            if logscore > self.max {
-                self.max = logscore;
+            if logscore > arc.max {
+                arc.max = logscore;
             }
-            let logscores = self.arcs.get_mut(self.n * p as usize + x as usize).unwrap();
-            logscores.push(logscore);
+            arc.logscores.push((flag, logscore));
             true
+        }
+
+        fn get(&self, p: u32, x: u32) -> &LogscoreMatrixArc {
+            self.arcs.get(self.n * p as usize + x as usize).unwrap()
+        }
+
+        fn get_mut(&mut self, p: u32, x: u32) -> &mut LogscoreMatrixArc {
+            self.arcs.get_mut(self.n * p as usize + x as usize).unwrap()
         }
 
     }
 
+    /// Compute the family scores for every variable and combination of up to k parent variables.
+    ///
     /// - Implements steps: 2
     ///
     /// Returns (logscore_matrix, max, min, accumulated, discarded)
-    pub fn logscores_from_map(k: u32, variables: &Variables, counts: DashMap<Array<Config>, u32, FxBuildHasher>, threshold: Option<f64>) -> Result<(LogscoreMatrix, f64, f64, usize, usize), String> {
-        let n = variables.len() as u32;
-        let mut logscores = LogscoreMatrix::new(n, threshold);
-        let mut max = f64::MIN; // The maximum logscore computed.
-        let mut min = f64::MAX; // The minimum logscore computed.
-        let mut accumulated = 0; // Number of logscores that were accumulated into a LogscoreMatrix.
-        let mut discarded = 0; // Number of logscores that were too small to be accumulated.
+    pub fn familyscores_from_counts(k: u32, variables: &Variables, counts: DashMap<Array<Config>, u32, FxBuildHasher>, threshold: Option<f64>) -> Result<(DashMap<(u32, Array<u32>), f64, FxBuildHasher>, u32), String> {
+        let family_scores: DashMap<(u32, Array<u32>), f64, FxBuildHasher> = DashMap::default();
+        let mut accumulated = 0; // Number of partial family score terms that were accumulated.
         let counts = counts.into_read_only();
         for (parent_config, parent_config_count) in counts.iter() {
             let parent_len = parent_config.len();
-            if parent_len == k as usize + 1 { // There are at most k parents.
-                continue;
+            if parent_len == k as usize + 1 {
+                continue; // There are at most k parent variables.
             }
             let mut parent_cardinality = 1;
             for p in parent_config.iter() { // Compute the number of parent configs.
@@ -247,279 +261,171 @@ pub mod k_neighbours {
             }
             let alpha = 0.5;
             let variable_alpha = alpha / parent_cardinality as f64;
+            // Iterate over all child variables and all the child variable's configs.
             let mut iter = ChildConfigIter::new(variables, parent_config);
-            while iter.next() {
-                let logscore = if let Some(config_count) = counts.get(iter.buffer()) {
-                    let child_cardinality = iter.child_cardinality();
-                    let config_alpha = variable_alpha / child_cardinality as f64;
-                    logscore(*config_count, *parent_config_count, variable_alpha, config_alpha)
-                } else {
-                    logscore_prior(*parent_config_count, variable_alpha)
-                };
-                if logscore < min {
-                    min = logscore;
-                }
-                if logscore > max {
-                    max = logscore;
-                }
-                for Config { variable: parent, .. } in parent_config.iter() { // Add the logscore for u -> x to each p -> x arc.
-                    let Config { variable: child, .. } = iter.child();
-                    if logscores.append(*parent, child, logscore) {
-                        accumulated += 1;
-                    } else {
-                        discarded += 1;
+            iter.next();
+            loop {
+                let current_child = iter.child().variable;
+                let mut partial_family_score = logscore_prior(*parent_config_count, variable_alpha);
+                let config_alpha = variable_alpha / iter.child_cardinality() as f64;
+                loop { // Iterate over the child variable's configs.
+                    if let Some(child_count) = counts.get(iter.buffer()) {
+                        partial_family_score += logscore_config(*child_count, config_alpha);
+                    }
+                    iter.next();
+                    if iter.child().variable != current_child {
+                        break;
                     }
                 }
-            }
-        }
-        Ok((logscores, max, min, accumulated, discarded))
-    }
-
-    /// todo: Test different locks:
-    /// std Mutex
-    /// parking_lot Mutex
-    /// spin Lock
-    pub struct ConcurrentLogscoreMatrix {
-        n: usize,
-        threshold: f64,
-        max: RwLock<f64>,
-        arcs: Vec<Arc<Mutex<Vec<f64>>>>,
-    }
-
-    impl ConcurrentLogscoreMatrix {
-
-        fn new(n: u32, threshold: Option<f64>) -> Self {
-            let n = n as usize;
-            let mut arcs = Vec::with_capacity(n * n);
-            for _ in 0..n*n {
-                arcs.push(Arc::new(Mutex::new(vec![])));
-            }
-            Self {
-                n,
-                threshold: threshold.unwrap_or(f64::MAX),
-                max: RwLock::new(f64::MIN),
-                arcs,
-            }
-        }
-
-        fn append(&self, p: u32, x: u32, logscore: f64) {
-            let max = *self.max.read();
-            if max - self.threshold < logscore {
-                return;
-            }
-            if logscore > max {
-                let mut locked_max = self.max.write();
-                if logscore > *locked_max {
-                    *locked_max = logscore;
+                accumulated += 1;
+                let mut parents = Vec::with_capacity(parent_config.len());
+                for pc in parent_config.iter() {
+                    parents.push(pc.variable);
+                }
+                // Add the partial family score term to the P -> x family score entry, where P is the
+                // parent variables, and x is the current child variable.
+                if let Some(mut family_score) = family_scores.get_mut(&(current_child, parents.clone().into_boxed_slice())) {
+                    *family_score += partial_family_score;
+                } else {
+                    family_scores.insert((current_child, parents.clone().into_boxed_slice()), partial_family_score);
+                }
+                if iter.is_done() {
+                    break;
                 }
             }
-            let mut locked_logscores = self.arcs[self.n * p as usize + x as usize].lock();
-            locked_logscores.push(logscore);
         }
-
+        Ok((family_scores, accumulated))
     }
 
-    // /// See [logscores_from_map].
-    // pub fn logscores_from_map_par(n: u32, counts: DashMap<Array<Config>, u32, FxBuildHasher>, threshold: Option<f64>) -> Result<LogscoreMatrix, String> {
-    //     let logscores = ConcurrentLogscoreMatrix::new(n, threshold);
-    //     let counts = counts.into_read_only();
-    //     //counts.par_iter().for_each(|entry| {
-    //     counts.par_iter().for_each(|entry| {
-    //         let len = entry.key().len();
-    //         if len == 1 { // Skip len 1, since they have no children.
+    /// Process the family scores.
+    ///
+    /// For each family score, iterate over every variable y. If this variable is in the parent set, this
+    /// family score is added to the positive and the total lists of y -> x. If this variable is not in
+    /// the parent set, this family score is added only to the total list of y -> x.
+    ///
+    ///
+    pub fn process_family_scores(n: u32, family_scores: DashMap<(u32, Array<u32>), f64, FxBuildHasher>, threshold: Option<f64>) -> Result<(LogscoreMatrix, u64, u64), String> {
+        let mut logscores = LogscoreMatrix::new(n, threshold);
+        let mut accumulated = 0;
+        let mut discarded = 0;
+        let family_scores = family_scores.into_read_only();
+        for ((child, parents), score) in family_scores.iter() {
+            let mut p = 0;
+            loop {
+                if p == *child { // todo efficiency
+                    p += 1;
+                    if p >= n {
+                        break;
+                    }
+                    continue;
+                }
+                let appended = if parents.contains(&p) {
+                    logscores.append(p, *child, true, *score)
+                } else {
+                    logscores.append(p, *child, false, *score)
+                };
+                if appended {
+                    accumulated += 1;
+                } else {
+                    discarded += 1;
+                }
+                p += 1;
+                if p >= n {
+                    break;
+                }
+            }
+        }
+        Ok((logscores, accumulated, discarded))
+    }
+
+    /// The log-sum-exp method is used here.
+    pub fn process_logscore_matrix(n: u32, logscores: LogscoreMatrix) -> Result<Ranking, String> {
+        let mut ranking = vec![];
+        for i in 0..n {
+            for j in i+1..n {
+                // Probability of i as a parent of j
+                let s1 = logscores.get(i, j);
+                let mut s1_positive = 0.0;
+                let mut s1_negative = 0.0;
+                for (flag, score) in &s1.logscores {
+                    if *flag {
+                        s1_positive += (score - s1.max).exp();
+                    } else {
+                        s1_negative += (score - s1.max).exp();
+                    }
+                }
+                let s1_pos = s1_positive.ln() + s1.max;
+                let s1_total = (s1_positive + s1_negative).ln() + s1.max;
+                let log_p1 = s1_pos - s1_total;
+                // Probability of j as a parent of i
+                let s2 = logscores.get(j, i);
+                let mut s2_positive = 0.0;
+                let mut s2_negative = 0.0;
+                for (flag, score) in &s2.logscores {
+                    if *flag {
+                        s2_positive += (score - s2.max).exp();
+                    } else {
+                        s2_negative += (score - s2.max).exp();
+                    }
+                }
+                let s2_pos = s2_positive.ln() + s2.max;
+                let s2_total = (s2_positive + s2_negative).ln() + s2.max;
+                let log_p2 = s2_pos - s2_total;
+                // Model averaging of the two probabilities. Could be done by max, min, or mean, for example.
+                ranking.push((i, j, log_p1.max(log_p2)));
+            }
+        }
+        ranking.par_sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        Ok(Ranking::from_sorted_vec(ranking))
+    }
+
+    // /// todo: Test different locks:
+    // /// std Mutex
+    // /// parking_lot Mutex
+    // /// spin Lock
+    // pub struct ConcurrentLogscoreMatrix {
+    //     n: usize,
+    //     threshold: f64,
+    //     max: RwLock<f64>,
+    //     arcs: Vec<Arc<Mutex<Vec<f64>>>>,
+    // }
+    //
+    // impl ConcurrentLogscoreMatrix {
+    //
+    //     fn new(n: u32, threshold: Option<f64>) -> Self {
+    //         let n = n as usize;
+    //         let mut arcs = Vec::with_capacity(n * n);
+    //         for _ in 0..n*n {
+    //             arcs.push(Arc::new(Mutex::new(vec![])));
+    //         }
+    //         Self {
+    //             n,
+    //             threshold: threshold.unwrap_or(f64::MAX),
+    //             max: RwLock::new(f64::MIN),
+    //             arcs,
+    //         }
+    //     }
+    //
+    //     fn append(&self, p: u32, x: u32, logscore: f64) {
+    //         let max = *self.max.read();
+    //         if max - self.threshold < logscore {
     //             return;
     //         }
-    //         let variables = entry.key();
-    //         let variables_count = *entry.value();
-    //         let mut parents = vec![Config { variable: 0, value: 0 }; len - 1];
-    //         for x_index in 0..len {
-    //             let x = variables[x_index].variable;
-    //             for v in 0..len { // Put all variables, except child, in the parent set
-    //                 if v < x_index {
-    //                     parents[v] = variables[v];
-    //                 } else if v > x_index {
-    //                     parents[v - 1] = variables[v];
-    //                 }
-    //             }
-    //             let parents_count = match counts.get((&parents).as_slice()) {
-    //                 None => continue,
-    //                 Some(l) => *l,
-    //             };
-    //             let logscore = log_score(variables_count, parents_count);
-    //             for p in &parents {
-    //                 let p = p.variable;
-    //                 logscores.append(p, x, logscore);
+    //         if logscore > max {
+    //             let mut locked_max = self.max.write();
+    //             if logscore > *locked_max {
+    //                 *locked_max = logscore;
     //             }
     //         }
-    //     });
-    //     let mut arcs = Vec::with_capacity(n as usize * n as usize);
-    //     for v in logscores.arcs.into_iter() {
-    //         arcs.push(Arc::into_inner(v).unwrap().into_inner());
+    //         let mut locked_logscores = self.arcs[self.n * p as usize + x as usize].lock();
+    //         locked_logscores.push(logscore);
     //     }
-    //     let logscores = LogscoreMatrix {
-    //         n: logscores.n,
-    //         threshold: logscores.threshold,
-    //         max: logscores.max.into_inner(),
-    //         arcs,
-    //     };
-    //     Ok(logscores)
+    //
     // }
-
-    /// Compute ranking from logscore matrix.
-    ///
-    /// *Implements steps: 3, 4, 5*
-    pub fn ranking_from_logscore_matrix(logscores: LogscoreMatrix) -> Result<Ranking, String> {
-        let n = logscores.n;
-        let mut arc_iter = VariableIter::new(n, 2);
-        let mut merge = vec![];
-        loop {
-            if !arc_iter.next() {
-                break;
-            }
-            let i = arc_iter.at()[0] as usize;
-            let j = arc_iter.at()[1] as usize;
-            let l1 = logscores.arcs[n * i + j].as_slice();
-            let l2 = logscores.arcs[n * j + i].as_slice();
-            let s = log_sum_exp_two(l1, l2); // todo: Average for now
-            //println!("Vals: i={} j={} l1len={} l2len={} s1={} s2={} s={}", i, j, l1.len(), l2.len(), s1, s2, s);
-            merge.push((i as u32, j as u32, s));
-        }
-        let mut ranking = merge;
-        ranking.par_sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-        Ok(Ranking { entries: ranking })
-    }
-
-    /// Compute ranking from logscore matrix.
-    ///
-    /// todo: Using a shared variable iter over multiple threads seems to perform much worse than the single-threaded version
-    ///
-    /// *Implements steps: 3, 4, 5*
-    pub fn ranking_from_logscore_matrix_par(logscores: LogscoreMatrix) -> Result<Ranking, String> {
-        let n = logscores.n;
-        let arc_iter = VariableIter::new(n, 2);
-        let arc_iter = Mutex::new(arc_iter);
-        let merge = vec![];
-        let merge = Mutex::new(merge);
-        let nthreads = thread::available_parallelism().unwrap().get();
-        thread::scope(|s| {
-            for _ in 1..nthreads {
-                s.spawn(|| {
-                    loop {
-                        let mut lock = arc_iter.lock();
-                        if !lock.next() {
-                            break;
-                        }
-                        let i = lock.at()[0] as usize;
-                        let j = lock.at()[1] as usize;
-                        drop(lock);
-                        let l1 = logscores.arcs[n * i + j].as_slice();
-                        let l2 = logscores.arcs[n * j + i].as_slice();
-                        let s1 = log_sum_exp(l1);
-                        let s2 = log_sum_exp(l2);
-                        let s = (s1 + s2) / 2.0; // todo
-                        //println!("Vals: i={} j={} l1len={} l2len={} s1={} s2={} s={}", i, j, l1.len(), l2.len(), s1, s2, s);
-                        let mut lock = merge.lock();
-                        lock.push((i as u32, j as u32, s));
-                        drop(lock);
-                    }
-                });
-            }
-        });
-        let mut ranking = merge.into_inner();
-        ranking.par_sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
-        Ok(Ranking { entries: ranking })
-    }
-
-    #[test]
-    #[ignore]
-    fn view_results() {
-        let file = File::open("sample.100.mn2").unwrap();
-        use std::time::Instant;
-        let t0 = Instant::now();
-        println!("Counting...");
-        let (variables, counts) = count_map_from_file_par(file, 2).unwrap();
-        let n = variables.len();
-        let t1 = Instant::now();
-        println!("Took {}", (t1 - t0).as_millis());
-        println!("Accumulating logscores...");
-        let (logscores, ..) = logscores_from_map(2, &variables, counts, Some(32.0)).unwrap();
-        let t2 = Instant::now();
-        println!("Took {}", (t2 - t1).as_millis());
-        println!("Ranking...");
-        let ranking = ranking_from_logscore_matrix(logscores).unwrap();
-        let t3 = Instant::now();
-        println!("Took {}", (t3 - t2).as_millis());
-        println!("{} k={} @ {}ms count={}ms acc={}ms rank={}ms", "sample.100.mn2", 2, (t3 - t0).as_millis(), (t1 - t0).as_millis(), (t2 - t1).as_millis(), (t3 - t2).as_millis());
-        let mut c = 0;
-        for r in ranking.entries {
-            println!("{} [{}->{}, {}]", c, r.0, r.1, r.2);
-            c += 1;
-            if c == 100 {
-                break;
-            }
-        }
-    }
 
     /// todo Iterate in a different order that can be taken advantage of by multiple threads.
     fn ranking_from_logscore_matrix_par2(_logscores: LogscoreMatrix) -> Result<Ranking, String> {
         todo!()
-    }
-
-    /// Benchmark discovery
-    ///
-    /// Run this test, with logging:
-    /// cargo test bench_kn -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn bench_kn() {
-        bench_kn_w("sample.2500.mn2", 1, true);
-        bench_kn_w("sample.2500.mn2", 1, false);
-        bench_kn_w("sample.2500.mn2", 2, true);
-        bench_kn_w("sample.2500.mn2", 2, false);
-    }
-
-    #[cfg(test)]
-    fn bench_kn_w(filen: &str, k: u32, par: bool) {
-        use std::time::Instant;
-        use std::hint::black_box;
-        let file = File::open(filen).unwrap();
-        let o = if par {
-            let t0 = Instant::now();
-            println!("Counting...");
-            let (variables, counts) = count_map_from_file_par(file, k).unwrap();
-            let n = variables.len();
-            let t1 = Instant::now();
-            println!("Took {}", (t1 - t0).as_millis());
-            println!("Accumulating logscores...");
-            let (logscores, ..) = logscores_from_map(k, &variables, counts, Some(32.0)).unwrap();
-            let t2 = Instant::now();
-            println!("Took {}", (t2 - t1).as_millis());
-            println!("Ranking...");
-            let ranking = ranking_from_logscore_matrix_par(logscores).unwrap();
-            let t3 = Instant::now();
-            println!("Took {}", (t3 - t2).as_millis());
-            println!("{} k={} par={} @ {}ms count={}ms acc={}ms rank={}ms", filen, k, par, (t3 - t0).as_millis(), (t1 - t0).as_millis(), (t2 - t1).as_millis(), (t3 - t2).as_millis());
-            ranking
-
-        } else {
-            let t0 = Instant::now();
-            println!("Counting...");
-            let (variables, counts) = count_map_from_file(file, k).unwrap();
-            let n = variables.len();
-            let t1 = Instant::now();
-            println!("Took {}", (t1 - t0).as_millis());
-            println!("Accumulating logscores...");
-            let (logscores, ..) = logscores_from_map(k, &variables, counts, Some(32.0)).unwrap();
-            let t2 = Instant::now();
-            println!("Took {}", (t2 - t1).as_millis());
-            println!("Ranking...");
-            let ranking = ranking_from_logscore_matrix(logscores).unwrap();
-            let t3 = Instant::now();
-            println!("Took {}", (t3 - t2).as_millis());
-            println!("{} k={} par={} @ {}ms count={}ms acc={}ms rank={}ms", filen, k, par, (t3 - t0).as_millis(), (t1 - t0).as_millis(), (t2 - t1).as_millis(), (t3 - t2).as_millis());
-            ranking
-        };
-        black_box(o);
     }
 
 }
